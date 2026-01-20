@@ -1,31 +1,29 @@
 import streamlit as st
+import pandas as pd
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 import requests
 from bs4 import BeautifulSoup
-import json
-import os
-import pandas as pd
+import datetime
 
-# --- KONFIGURASI ---
-st.set_page_config(page_title="My Wealth Tracker", page_icon="💰", layout="centered")
-DB_FILE = "dompet_saya.json"
+# --- SETUP HALAMAN ---
+st.set_page_config(page_title="Wealth Tracker Pro", page_icon="💎", layout="centered")
 
-# --- FUNGSI BACKEND (SAMA SEPERTI SEBELUMNYA) ---
-def load_data():
-    if not os.path.exists(DB_FILE):
-        return {"cash": 0, "investments": {"Emas (Gram)": 0, "Bitcoin": 0, "Saham BBCA": 0}}
-    with open(DB_FILE, "r") as f:
-        return json.load(f)
+# --- KONEKSI KE GOOGLE SHEETS ---
+# Kita pakai st.secrets biar aman (password gak ditaruh di codingan)
+def connect_db():
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    # Mengambil credentials dari Secret Streamlit Cloud
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    client = gspread.authorize(creds)
+    # Buka Spreadsheet berdasarkan nama file
+    sheet = client.open("Database_Kekayaan")
+    return sheet
 
-def save_data(data):
-    with open(DB_FILE, "w") as f:
-        json.dump(data, f, indent=4)
-
+# --- FUNGSI UPDATE HARGA LIVE ---
+@st.cache_data(ttl=60)
 def get_live_price(ticker):
-    # Menggunakan cache agar tidak nembak server Yahoo terus menerus setiap klik
-    return fetch_price(ticker)
-
-@st.cache_data(ttl=60) # Data disimpan 60 detik di memori
-def fetch_price(ticker):
     url = f"https://finance.yahoo.com/quote/{ticker}"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
@@ -34,84 +32,101 @@ def fetch_price(ticker):
         price_tag = soup.find('fin-streamer', {'data-field': 'regularMarketPrice'})
         if price_tag:
             price = float(price_tag.text.replace(',', ''))
-            if "XAU" in ticker: price /= 31.1035 # Ounce to Gram
-            if "USD" in ticker: price *= 16200   # Estimasi Kurs
+            if "XAU" in ticker: price /= 31.1035 # Ounce ke Gram
+            if "USD" in ticker: price *= 16200   # Kurs USD
             return price
     except:
         pass
     return 0
 
-# --- TAMPILAN APLIKASI (FRONTEND) ---
-st.title("💰 Wealth Dashboard")
-st.markdown("Pantau kekayaanmu *real-time* dari mana saja.")
+# --- LOAD DATA DARI SHEETS ---
+try:
+    sh = connect_db()
+    ws_history = sh.worksheet("History")
+    ws_portfolio = sh.worksheet("Portfolio")
+except Exception as e:
+    st.error("Gagal konek ke Google Sheets! Pastikan setup Secret benar.")
+    st.stop()
 
-# Load Data
-data = load_data()
+# --- HITUNG SALDO MANUAL DARI HISTORY ---
+# Kita ambil semua history, jumlahkan kolom Nominal
+all_history = ws_history.get_all_records()
+df_history = pd.DataFrame(all_history)
 
-# --- SIDEBAR (INPUT DATA) ---
-st.sidebar.header("⚙️ Update Aset")
+if not df_history.empty:
+    # Pastikan kolom Nominal dianggap angka
+    df_history['Nominal'] = pd.to_numeric(df_history['Nominal'])
+    saldo_manual = df_history['Nominal'].sum()
+else:
+    saldo_manual = 0
 
-# Update Uang Tunai
-st.sidebar.subheader("Dompet Manual")
-cash_input = st.sidebar.number_input("Saldo Uang Tunai (Rp)", value=float(data['cash']), step=100000.0)
-if st.sidebar.button("Simpan Saldo"):
-    data['cash'] = cash_input
-    save_data(data)
-    st.sidebar.success("Saldo Disimpan!")
-    st.rerun()
+# --- UI APLIKASI ---
+st.title("💎 Wealth Tracker Pro")
 
-# Update Investasi
-st.sidebar.subheader("Portofolio Investasi")
-asset_choice = st.sidebar.selectbox("Pilih Aset", list(data['investments'].keys()))
-qty_input = st.sidebar.number_input(f"Jumlah {asset_choice}", value=float(data['investments'][asset_choice]))
+# 1. INFO SALDO UTAMA
+col1, col2 = st.columns(2)
+col1.metric("💵 Uang Tunai (Manual)", f"Rp {saldo_manual:,.0f}")
 
-if st.sidebar.button("Update Aset"):
-    data['investments'][asset_choice] = qty_input
-    save_data(data)
-    st.sidebar.success("Aset Disimpan!")
-    st.rerun()
+# Hitung Investasi
+portfolio_data = ws_portfolio.get_all_records()
+total_investasi = 0
+rincian_investasi = []
 
-# --- HALAMAN UTAMA (VISUALISASI) ---
-
-# 1. Kalkulasi Total
-ASSET_MAPPING = {
-    "Emas (Gram)": "XAU-IDR=X",  
+ASSET_CODES = {
+    "Emas (Gram)": "XAU-IDR=X",
     "Bitcoin": "BTC-USD",
     "Saham BBCA": "BBCA.JK"
 }
 
-total_investasi = 0
-rincian_aset = []
+for item in portfolio_data:
+    nama_aset = item['Aset']
+    jumlah = float(item['Jumlah']) if item['Jumlah'] != '' else 0
+    
+    if jumlah > 0:
+        harga = get_live_price(ASSET_CODES.get(nama_aset, ""))
+        nilai = harga * jumlah
+        total_investasi += nilai
+        rincian_investasi.append({"Aset": nama_aset, "Jml": jumlah, "Nilai": nilai})
 
-for asset, qty in data['investments'].items():
-    if qty > 0:
-        price = get_live_price(ASSET_MAPPING[asset])
-        val = price * qty
-        total_investasi += val
-        rincian_aset.append({"Aset": asset, "Jumlah": qty, "Harga Pasar": price, "Total Nilai": val})
-
-grand_total = data['cash'] + total_investasi
-
-# 2. Tampilkan Big Numbers (Metrics)
-col1, col2 = st.columns(2)
-col1.metric("💵 Uang Tunai", f"Rp {data['cash']:,.0f}")
-col2.metric("📈 Nilai Investasi", f"Rp {total_investasi:,.0f}")
-
+col2.metric("📈 Aset Investasi", f"Rp {total_investasi:,.0f}")
 st.divider()
-st.metric("💎 TOTAL KEKAYAAN BERSIH", f"Rp {grand_total:,.0f}", delta_color="normal")
+st.subheader(f"Total Kekayaan: Rp {saldo_manual + total_investasi:,.0f}")
 
-# 3. Tabel Detail
-if rincian_aset:
-    st.subheader("Rincian Aset")
-    df = pd.DataFrame(rincian_aset)
-    # Format Rupiah di Tabel
-    st.dataframe(df.style.format({"Harga Pasar": "Rp {:,.0f}", "Total Nilai": "Rp {:,.0f}"}))
+# --- INPUT TRANSAKSI (FITUR BARU) ---
+with st.container():
+    st.write("### 📝 Catat Uang Masuk/Keluar")
+    c1, c2, c3 = st.columns([2, 2, 1])
+    ket = c1.text_input("Keterangan (ex: Gaji, Makan)")
+    nom = c2.number_input("Nominal (Minus untuk pengeluaran)", step=10000)
+    
+    if c3.button("Simpan"):
+        if ket and nom != 0:
+            waktu = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            # Simpan ke Google Sheet tab History
+            ws_history.append_row([waktu, ket, nom])
+            st.success("Tersimpan!")
+            st.rerun() # Refresh halaman
+        else:
+            st.warning("Isi keterangan & nominal!")
 
-    # 4. Bonus: Grafik Lingkaran
-    st.subheader("Komposisi Kekayaan")
-    chart_data = {"Aset": ["Uang Tunai"] + [x['Aset'] for x in rincian_aset], 
-                  "Nilai": [data['cash']] + [x['Total Nilai'] for x in rincian_aset]}
-    st.bar_chart(pd.DataFrame(chart_data).set_index("Aset"))
+# --- LIHAT HISTORY (REQUEST KAMU) ---
+# Ini fitur yang kamu minta "Pilih aja ada history gitu dipencet"
+with st.expander("📜 Lihat Riwayat Transaksi Manual"):
+    if not df_history.empty:
+        # Tampilkan tabel, urutkan dari yang terbaru
+        st.dataframe(df_history.sort_index(ascending=False), use_container_width=True)
+    else:
+        st.info("Belum ada data history.")
 
-else:
-    st.info("Belum ada aset investasi. Tambahkan di menu sebelah kiri/atas (tanda panah).")
+# --- UPDATE ASET ---
+with st.expander("⚙️ Update Jumlah Aset Investasi"):
+    aset_list = [d['Aset'] for d in portfolio_data]
+    pilih_aset = st.selectbox("Pilih Aset", aset_list)
+    jumlah_baru = st.number_input("Jumlah Total Terbaru", min_value=0.0, step=0.1)
+    
+    if st.button("Update Portfolio"):
+        # Cari baris aset tersebut di Google Sheet
+        cell = ws_portfolio.find(pilih_aset)
+        ws_portfolio.update_cell(cell.row, 2, jumlah_baru) # Update kolom ke-2
+        st.success("Portfolio Updated!")
+        st.rerun()
